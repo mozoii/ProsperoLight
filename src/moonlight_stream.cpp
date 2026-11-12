@@ -78,6 +78,8 @@
 #define PIPELINE_CLEAN_OUTPUTS 600u
 #define PRESENT_FAILURE_LIMIT 3u
 #define CATCHUP_HOLD_US UINT64_C(250000)
+// How long one unanswered native keyframe request suppresses the next one.
+#define KEYFRAME_REARM_US UINT64_C(1000000)
 #define MOONLIGHT_IDENTITY_DIRECTORY (storage::paths().pairing)
 #define CONTROLLER_KEEPALIVE_US UINT64_C(1000000)
 #define CONNECTION_SETUP_TIMEOUT_US UINT64_C(20000000)
@@ -634,6 +636,7 @@ typedef struct native_renderer_state
     bool stream_aware;
     bool recovery_pending;
     bool parameters_requested;
+    uint64_t parameters_requested_us;
     uint32_t test_capacity_errors;
     moonlight::video::ParameterSets parameter_sets;
     uint64_t transition_wait_since;
@@ -2206,7 +2209,8 @@ static bool configure_stream_decoder(native_renderer_state_t *state,
 // A changed parameter advertisement is not an activation. PPS/slice IDs select
 // the stream facts. New/reset instances require fresh matching SPS/PPS at an
 // actual IDR boundary. Never replay cached raw parameter NALs.
-static bool prepare_stream_decoder(native_renderer_state_t *state, PDECODE_UNIT unit)
+static bool prepare_stream_decoder(native_renderer_state_t *state, PDECODE_UNIT unit,
+                                   const char **reason = nullptr)
 {
     using namespace moonlight::video;
     const Codec codec = state->mode->codec_type == 1 ? Codec::H264 : Codec::Hevc;
@@ -2232,6 +2236,8 @@ static bool prepare_stream_decoder(native_renderer_state_t *state, PDECODE_UNIT 
             const auto parsed = parse_sps(codec, data, entry->length, r);
             if (parsed == ParseResult::Unsupported && unit->frameType != FRAME_TYPE_IDR)
             {
+                if (reason)
+                    *reason = "sps-unsupported";
                 if (state->policy_keyframe_wait)
                 {
                     if (state->stream_policy.pending_depth)
@@ -2349,6 +2355,13 @@ static bool prepare_stream_decoder(native_renderer_state_t *state, PDECODE_UNIT 
             state->policy_keyframe_wait = false;
             state->transition_wait_since = 0;
         }
+        if (reason)
+            *reason = !selected                          ? "slice-unnamed"
+                      : unknown                          ? "pps-unknown"
+                      : conflict                         ? "parameters-conflict"
+                      : !safe_idr                        ? "slice-not-keyframe"
+                      : unit->frameType != FRAME_TYPE_IDR ? "awaiting-keyframe"
+                                                         : "parameter-sets-missing";
         if (!state->transition_wait_since)
         {
             state->transition_wait_since = monotonic_us();
@@ -2560,14 +2573,41 @@ static int decode_access_unit(native_renderer_state_t *state, PDECODE_UNIT decod
         lifecycle_failure(state, moonlight::video::Error::Parameters, -30);
         return DR_OK;
     }
-    if (state->stream_aware && !prepare_stream_decoder(state, decode_unit))
+    if (state->stream_aware)
     {
-        if (state->policy_keyframe_wait)
-            ++state->policy_dropped_aus;
-        if (!state->running || state->parameters_requested)
-            return DR_OK;
-        state->parameters_requested = true;
-        return DR_NEED_IDR;
+        const uint64_t waits_before = state->parameter_transition_waits;
+        const char *transition_reason = nullptr;
+        if (!prepare_stream_decoder(state, decode_unit, &transition_reason))
+        {
+            if (state->policy_keyframe_wait)
+                ++state->policy_dropped_aus;
+            if (state->parameter_transition_waits != waits_before)
+            {
+                // One line per episode, so a stuck transition names its term.
+                char receipt[224];
+                snprintf(receipt, sizeof(receipt),
+                         "Native parameter transition: reason=%s frame=%d type=%d waits=%llu "
+                         "requested=%u",
+                         transition_reason ? transition_reason : "unspecified",
+                         decode_unit->frameNumber, int(decode_unit->frameType),
+                         (unsigned long long)state->parameter_transition_waits,
+                         unsigned(state->parameters_requested));
+                (void)lan_http_report_text(receipt);
+            }
+            // An outstanding request that produced nothing usable must not latch:
+            // ask again once it expires, so one unusable keyframe cannot stop the
+            // stream until the transition deadline kills it.
+            const uint64_t now = monotonic_us();
+            if (state->parameters_requested && decode_unit->frameType == FRAME_TYPE_IDR &&
+                now >= state->parameters_requested_us &&
+                now - state->parameters_requested_us >= KEYFRAME_REARM_US)
+                state->parameters_requested = false;
+            if (!state->running || state->parameters_requested)
+                return DR_OK;
+            state->parameters_requested = true;
+            state->parameters_requested_us = now;
+            return DR_NEED_IDR;
+        }
     }
 #if PROSPEROLIGHT_TEST_LAB
     // This is a declared synthetic API error, not a hardware-error observation.

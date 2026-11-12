@@ -8,6 +8,8 @@
 namespace moonlight::video
 {
 // Only the bounded prefix needed for PPS/slice IDs. No full slice decoding.
+// `found` reports a complete header of the wanted type, never a NAL start whose
+// header a fragment boundary or an escape byte cut in half.
 inline bool parameter_ids(Codec codec, const uint8_t *p, size_t n, bool picture, uint32_t &id,
                           uint32_t &sps, bool *idr = nullptr, bool *found = nullptr,
                           uint32_t *picture_type = nullptr)
@@ -25,19 +27,15 @@ inline bool parameter_ids(Codec codec, const uint8_t *p, size_t n, bool picture,
         else
             continue;
         const unsigned header = codec == Codec::H264 ? 1 : 2;
+        // Inconclusive, not unknown: this fragment cannot prove anything about
+        // the picture, so the caller must not reject the access unit for it.
         if (start + header >= limit || (p[start] & 128))
-        {
-            if (found)
-                *found = true;
             return false;
-        }
         const unsigned type = codec == Codec::H264 ? p[start] & 31 : (p[start] >> 1) & 63;
         const bool wanted = picture ? (codec == Codec::H264 ? type == 1 || type == 5 : type <= 31)
                                     : type == (codec == Codec::H264 ? 8u : 34u);
         if (!wanted)
             continue;
-        if (found)
-            *found = true;
         if (idr)
             *idr = codec == Codec::H264 ? type == 5 : type == 19 || type == 20;
         Bits b(p + start + header, std::min<size_t>(128, limit - start - header));
@@ -63,6 +61,8 @@ inline bool parameter_ids(Codec codec, const uint8_t *p, size_t n, bool picture,
             id = b.ue(codec == Codec::H264 ? 255 : 63);
             sps = b.ue(codec == Codec::H264 ? 31 : 15);
         }
+        if (found)
+            *found = b.ok;
         return b.ok;
     }
     return false;
